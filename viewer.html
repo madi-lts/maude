@@ -40,6 +40,7 @@ aside { width: 320px; min-width: 240px; flex-shrink: 0; border-right: 1px solid 
 .project > .pname:hover { color: var(--accent); }
 .project .count { color: var(--dim); font-weight: 400; }
 .session { padding: 6px 12px 6px 22px; cursor: pointer; border-left: 2px solid transparent; }
+.session.chat { padding-left: 12px; }
 .session:hover { background: var(--user-bg); }
 .session.active { border-left-color: var(--accent); background: var(--user-bg); }
 .session .stitle { font-size: 13px; overflow: hidden; display: -webkit-box;
@@ -78,6 +79,8 @@ details.blk pre { margin: 6px 0; }
   font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 10; }
 #toast.show { opacity: 1; }
 .empty { color: var(--dim); padding: 40px 0; text-align: center; }
+aside .empty { padding: 24px 14px; }
+.empty .hint { margin-top: 10px; font-size: 12px; text-align: left; line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -104,7 +107,8 @@ window.addEventListener("DOMContentLoaded", init);
 
 let projects = [];
 let activeSession = null;
-let activeKind = "code";  // which tab is showing: "code" or "chat"
+let activeKind = "code";  // which tab is showing: "code" (local Claude Code
+                          // transcripts) or "chat" (claude.ai export)
 
 async function api(path) {
   const r = await fetch(path);
@@ -127,8 +131,40 @@ async function init() {
 }
 
 async function loadProjects() {
-  projects = await api("/api/projects?kind=" + activeKind);
+  if (activeKind === "chat") { await loadChats(); return; }
+  projects = await api("/api/projects");
   renderProjectList();
+}
+
+async function loadChats() {
+  const list = document.getElementById("sidebar-list");
+  const data = await api("/api/chats");
+  list.textContent = "";
+  if (!data.found) {
+    const box = el("div", "empty");
+    box.append(document.createTextNode("No claude.ai export found."));
+    box.append(el("div", "hint",
+      "claude.ai chats live in your account, not on disk. Download an export " +
+      "(claude.ai → Settings → Privacy → Export data) and unzip it so " +
+      "conversations.json sits in ~/.claude/chats/ — or point --chats at it."));
+    list.append(box);
+    return;
+  }
+  if (!data.chats.length) {
+    list.append(el("div", "empty", "The export contains no chats."));
+    return;
+  }
+  for (const c of data.chats) {
+    const row = el("div", "session chat");
+    row.dataset.key = "chat/" + c.id;
+    row.append(el("div", "stitle", c.title));
+    row.append(el("div", "sdate",
+      (c.updated ? new Date(c.updated).toLocaleString() + " · " : "") + c.messages + " msgs"));
+    row.addEventListener("click", () => openChat(c.id, c.title));
+    list.append(row);
+  }
+  for (const row of list.querySelectorAll(".session"))
+    row.classList.toggle("active", row.dataset.key === activeSession);
 }
 
 function setTab(kind) {
@@ -154,9 +190,7 @@ function renderProjectList() {
   const list = document.getElementById("sidebar-list");
   list.textContent = "";
   if (!projects.length) {
-    list.append(el("div", "empty",
-      activeKind === "chat" ? "No chats found under the transcript root."
-                            : "No code sessions found under the transcript root."));
+    list.append(el("div", "empty", "No projects found under the transcript root."));
     return;
   }
   for (const p of projects) {
@@ -172,8 +206,7 @@ function renderProjectList() {
       sessions.hidden = !sessions.hidden;
       if (loaded || sessions.hidden) return;
       loaded = true;
-      const items = await api("/api/sessions?project=" + encodeURIComponent(p.dir) +
-        "&kind=" + activeKind);
+      const items = await api("/api/sessions?project=" + encodeURIComponent(p.dir));
       for (const s of items) {
         const row = el("div", "session");
         row.dataset.key = p.dir + "/" + s.id;
@@ -219,6 +252,28 @@ async function openSession(project, sessionId, title) {
   } catch (err) {
     pane.textContent = "";
     pane.append(el("div", "empty", "Failed to load session: " + err.message));
+  }
+  document.querySelector("main").scrollTop = 0;
+}
+
+/* claude.ai chats come from a static export, so no live polling. */
+async function openChat(chatId, title) {
+  stopLive();
+  activeSession = "chat/" + chatId;
+  for (const row of document.querySelectorAll(".session"))
+    row.classList.toggle("active", row.dataset.key === activeSession);
+  const pane = document.getElementById("messages");
+  pane.textContent = "";
+  try {
+    const data = await api("/api/chat?id=" + encodeURIComponent(chatId));
+    document.getElementById("title").textContent =
+      "claude.ai — " + (title || data.title || chatId);
+    for (const m of data.messages) pane.append(renderMessage(m));
+    if (!pane.children.length)
+      pane.append(el("div", "empty", "No displayable messages."));
+  } catch (err) {
+    pane.textContent = "";
+    pane.append(el("div", "empty", "Failed to load chat: " + err.message));
   }
   document.querySelector("main").scrollTop = 0;
 }
@@ -413,8 +468,9 @@ async function runSearch(query) {
       snippet.textContent = h.snippet;
     }
     row.append(snippet);
-    row.append(el("div", "sdate", h.label + " · " + h.role));
-    row.addEventListener("click", () =>
+    row.append(el("div", "sdate", (h.label || h.title || "") + " · " + h.role));
+    if (h.chat) row.addEventListener("click", () => openChat(h.chat, h.title));
+    else row.addEventListener("click", () =>
       openSession({ dir: h.project, label: h.label }, h.session, null));
     list.append(row);
   }

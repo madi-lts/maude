@@ -11,17 +11,18 @@ front-end edits just need a refresh).
 
 ```
 python3 maude.py            # serve on localhost:8483 + open browser
-python3 maude.py --help     # --port, --root, --host, --no-browser
+python3 maude.py --help     # --port, --root, --chats, --host, --no-browser
 ```
 
 No dependencies beyond the Python stdlib; the page pulls marked, DOMPurify and
 KaTeX from jsDelivr, so the *browser* needs network access (the server binds to
 localhost only).
 
-- **Tabs** — `</> Code` and `Chats` split the sidebar: a session counts as
-  code when tool calls dominate its transcript (at least three, and at least
-  one per five messages); a conversation with incidental tool use stays a
-  chat. Projects, session lists, and search all follow the active tab.
+- **Tabs** — `</> Code` shows local Claude Code transcripts; `Chats` shows
+  your claude.ai conversations, read from a data export (claude.ai →
+  Settings → Privacy → Export data). Unzip the export so
+  `conversations.json` sits in `~/.claude/chats/`, or point `--chats` at
+  the file or its directory. Search follows the active tab.
 - **Sidebar** — projects (labeled from the `cwd` recorded in transcripts) with
   sessions sorted by last modified, titled by summary or first user message.
 - **Math** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]`, and bare `\begin{align}`-style
