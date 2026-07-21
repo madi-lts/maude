@@ -2,7 +2,8 @@
 """maude — browse Claude Code transcripts with real math rendering.
 
 Local web app, stdlib only. Serves a small JSON API over
-~/.claude/projects/ plus the viewer.html page next to this script, which
+~/.claude/projects/ (Code tab) and an optional claude.ai data export
+(Chats tab), plus the viewer.html page next to this script, which
 renders conversations with marked (markdown) + KaTeX (math). Open
 sessions live-update as new records are appended to the transcript.
 Double-click any rendered equation to copy its TeX source;
@@ -12,6 +13,7 @@ Usage:
     python3 maude.py                  # serve + open browser
     python3 maude.py --port 9000
     python3 maude.py --root /path/to/projects --no-browser
+    python3 maude.py --chats ~/Downloads/export/conversations.json
 
 The page loads marked, DOMPurify and KaTeX from jsDelivr, so the browser
 needs network access; the server itself binds to localhost only.
@@ -27,10 +29,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
+DEFAULT_CHATS = os.path.expanduser("~/.claude/chats")
 
-# cheap per-line checks, tolerant of JSON spacing
+# cheap per-line check for countable records, tolerant of JSON spacing
 MSG_TYPE_RE = re.compile(r'"type"\s*:\s*"(?:user|assistant)"')
-TOOL_USE_RE = re.compile(r'"type"\s*:\s*"tool_use"')
 
 # --------------------------------------------------------------------------
 # Transcript parsing
@@ -88,38 +90,7 @@ def project_label(project_dir, dirname):
     return dirname
 
 
-# A session counts as "code" when tool activity dominates the transcript:
-# at least three tool calls, and at least one per five user/assistant
-# records. Incidental tool use (a chat where Claude checks an integral
-# with python) stays a chat. Cached per path — transcripts only ever
-# grow, so (mtime, size) invalidates the entry for live sessions.
-_kind_cache = {}
-
-
-def session_kind(path):
-    try:
-        st = os.stat(path)
-    except OSError:
-        return "chat"
-    stamp = (st.st_mtime, st.st_size)
-    cached = _kind_cache.get(path)
-    if cached and cached[0] == stamp:
-        return cached[1]
-    tools = records = 0
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if MSG_TYPE_RE.search(line):
-                    records += 1
-                tools += len(TOOL_USE_RE.findall(line))
-    except OSError:
-        pass
-    kind = "code" if tools >= 3 and tools * 5 >= records else "chat"
-    _kind_cache[path] = (stamp, kind)
-    return kind
-
-
-def list_projects(root, kind=None):
+def list_projects(root):
     out = []
     try:
         entries = list(os.scandir(root))
@@ -128,17 +99,15 @@ def list_projects(root, kind=None):
     for entry in entries:
         if not entry.is_dir():
             continue
-        paths = [os.path.join(entry.path, f) for f in session_files(entry.path)]
-        if kind:
-            paths = [p for p in paths if session_kind(p) == kind]
-        if not paths:
+        files = session_files(entry.path)
+        if not files:
             continue
-        mtime = max(os.path.getmtime(p) for p in paths)
+        mtime = max(os.path.getmtime(os.path.join(entry.path, f)) for f in files)
         out.append(
             {
                 "dir": entry.name,
                 "label": project_label(entry.path, entry.name),
-                "sessions": len(paths),
+                "sessions": len(files),
                 "mtime": mtime,
             }
         )
@@ -173,14 +142,11 @@ def session_title(path):
     return fallback or "(no user message)"
 
 
-def list_sessions(root, project, kind=None):
+def list_sessions(root, project):
     pdir = safe_join(root, project)
     out = []
     for name in session_files(pdir):
         path = os.path.join(pdir, name)
-        skind = session_kind(path)
-        if kind and skind != kind:
-            continue
         title = session_title(path)
         if len(title) > 120:
             title = title[:120] + "…"
@@ -194,7 +160,6 @@ def list_sessions(root, project, kind=None):
                 "id": name[:-6],
                 "title": title,
                 "messages": count,
-                "kind": skind,
                 "mtime": os.path.getmtime(path),
             }
         )
@@ -305,22 +270,19 @@ def load_messages(root, project, session, offset=0):
     return {"offset": offset + end, "reset": reset, "messages": messages}
 
 
-def search_transcripts(root, query, kind=None, limit=100):
+def search_transcripts(root, query, limit=100):
     """Case-insensitive substring search over text/thinking blocks and
     session titles (summary records).
 
     Lines are pre-filtered with a raw substring check before JSON parsing,
     so matches hidden behind \\uXXXX escapes can be missed — acceptable for
-    an interactive grep. `kind` restricts the search to code or chat
-    sessions."""
+    an interactive grep."""
     q = query.lower()
     results = []
-    for proj in list_projects(root, kind):
+    for proj in list_projects(root):
         pdir = os.path.join(root, proj["dir"])
         for name in session_files(pdir):
             path = os.path.join(pdir, name)
-            if kind and session_kind(path) != kind:
-                continue
             with open(path, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     if q not in line.lower():
@@ -377,26 +339,189 @@ def search_transcripts(root, query, kind=None, limit=100):
 
 
 # --------------------------------------------------------------------------
+# claude.ai chats — read from a data export (claude.ai → Settings →
+# Privacy → Export data), whose conversations.json holds every chat.
+# `chats_path` may be that file or a directory containing it.
+# --------------------------------------------------------------------------
+
+_chats_cache = {"stamp": None, "convos": []}
+
+
+def chats_file(chats_path):
+    if os.path.isfile(chats_path):
+        return chats_path
+    cand = os.path.join(chats_path, "conversations.json")
+    return cand if os.path.isfile(cand) else None
+
+
+def load_chats(chats_path):
+    """Parsed conversations, cached until the export file changes."""
+    path = chats_file(chats_path)
+    if not path:
+        return []
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    stamp = (path, st.st_mtime, st.st_size)
+    if _chats_cache["stamp"] == stamp:
+        return _chats_cache["convos"]
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return []
+    convos = [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
+    _chats_cache.update(stamp=stamp, convos=convos)
+    return convos
+
+
+def chat_title(convo):
+    name = (convo.get("name") or "").strip()
+    if name:
+        return name
+    for m in convo.get("chat_messages") or []:
+        if isinstance(m, dict) and m.get("sender") == "human":
+            text = (m.get("text") or "").strip()
+            if text:
+                return text[:120] + ("…" if len(text) > 120 else "")
+    return "(untitled)"
+
+
+def list_chats(chats_path):
+    out = []
+    for c in load_chats(chats_path):
+        out.append(
+            {
+                "id": c.get("uuid") or "",
+                "title": chat_title(c),
+                "messages": len(c.get("chat_messages") or []),
+                "updated": c.get("updated_at") or c.get("created_at") or "",
+            }
+        )
+    out.sort(key=lambda s: s["updated"], reverse=True)
+    return {"found": chats_file(chats_path) is not None, "chats": out}
+
+
+def chat_blocks(msg):
+    """Viewer-shaped blocks from an export chat message. Newer exports
+    carry typed content blocks; older ones only the flat `text`."""
+    blocks = []
+    for b in msg.get("content") or []:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t == "text":
+            blocks.append({"type": "text", "text": (b.get("text") or "")[:MAX_BLOCK]})
+        elif t == "thinking":
+            blocks.append(
+                {
+                    "type": "thinking",
+                    "text": (b.get("thinking") or b.get("text") or "")[:MAX_BLOCK],
+                }
+            )
+        elif t == "tool_use":
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "name": b.get("name", "?"),
+                    "input": json.dumps(b.get("input", {}), indent=2, ensure_ascii=False)[
+                        :MAX_BLOCK
+                    ],
+                }
+            )
+        elif t == "tool_result":
+            blocks.append(
+                {"type": "tool_result", "text": tool_result_text(b)[:MAX_BLOCK]}
+            )
+    if not blocks and msg.get("text"):
+        blocks.append({"type": "text", "text": msg["text"][:MAX_BLOCK]})
+    return blocks
+
+
+def load_chat(chats_path, chat_id):
+    for c in load_chats(chats_path):
+        if c.get("uuid") != chat_id:
+            continue
+        messages = []
+        for m in c.get("chat_messages") or []:
+            if not isinstance(m, dict):
+                continue
+            blocks = chat_blocks(m)
+            if not blocks:
+                continue
+            messages.append(
+                {
+                    "role": "user" if m.get("sender") == "human" else "assistant",
+                    "ts": m.get("created_at"),
+                    "mid": m.get("uuid"),
+                    "meta": False,
+                    "blocks": blocks,
+                }
+            )
+        return {"title": chat_title(c), "messages": messages}
+    raise ValueError("chat not found")
+
+
+def search_chats(chats_path, query, limit=100):
+    """Case-insensitive substring search over chat titles and messages."""
+    q = query.lower()
+    results = []
+    for c in load_chats(chats_path):
+        title = chat_title(c)
+        if q in title.lower():
+            results.append(
+                {"chat": c.get("uuid"), "title": title, "role": "title", "snippet": title}
+            )
+            if len(results) >= limit:
+                return results
+        for m in c.get("chat_messages") or []:
+            if not isinstance(m, dict):
+                continue
+            texts = [
+                b.get("text") or b.get("thinking") or ""
+                for b in m.get("content") or []
+                if isinstance(b, dict) and b.get("type") in ("text", "thinking")
+            ] or [m.get("text") or ""]
+            for text in texts:
+                idx = text.lower().find(q)
+                if idx < 0:
+                    continue
+                start = max(0, idx - 80)
+                end = min(len(text), idx + len(query) + 80)
+                results.append(
+                    {
+                        "chat": c.get("uuid"),
+                        "title": title,
+                        "role": "user" if m.get("sender") == "human" else "assistant",
+                        "snippet": text[start:end],
+                    }
+                )
+                if len(results) >= limit:
+                    return results
+                break  # one hit per message is plenty
+    return results
+
+
+# --------------------------------------------------------------------------
 # HTTP server
 # --------------------------------------------------------------------------
 
 
 class Handler(BaseHTTPRequestHandler):
     root = DEFAULT_ROOT
+    chats = DEFAULT_CHATS
 
     def do_GET(self):
         url = urlparse(self.path)
         params = {k: v[0] for k, v in parse_qs(url.query).items()}
-        kind = params.get("kind")
-        if kind not in ("code", "chat"):
-            kind = None
         try:
             if url.path in ("", "/"):
                 self.respond(load_page(), "text/html; charset=utf-8")
             elif url.path == "/api/projects":
-                self.send_json(list_projects(self.root, kind))
+                self.send_json(list_projects(self.root))
             elif url.path == "/api/sessions":
-                self.send_json(list_sessions(self.root, params["project"], kind))
+                self.send_json(list_sessions(self.root, params["project"]))
             elif url.path == "/api/messages":
                 self.send_json(
                     load_messages(
@@ -406,11 +531,18 @@ class Handler(BaseHTTPRequestHandler):
                         int(params.get("offset", 0)),
                     )
                 )
+            elif url.path == "/api/chats":
+                self.send_json(list_chats(self.chats))
+            elif url.path == "/api/chat":
+                self.send_json(load_chat(self.chats, params["id"]))
             elif url.path == "/api/search":
                 query = params.get("q", "").strip()
-                self.send_json(
-                    search_transcripts(self.root, query, kind) if query else []
-                )
+                if not query:
+                    self.send_json([])
+                elif params.get("kind") == "chat":
+                    self.send_json(search_chats(self.chats, query))
+                else:
+                    self.send_json(search_transcripts(self.root, query))
             else:
                 self.send_error(404)
         except (KeyError, ValueError) as exc:
@@ -453,6 +585,12 @@ def main():
     parser.add_argument(
         "--root", default=DEFAULT_ROOT, help="transcript root (default: ~/.claude/projects)"
     )
+    parser.add_argument(
+        "--chats",
+        default=DEFAULT_CHATS,
+        help="claude.ai data export: conversations.json or a directory holding "
+        "it (default: ~/.claude/chats)",
+    )
     parser.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
     args = parser.parse_args()
 
@@ -460,9 +598,12 @@ def main():
         sys.exit(f"transcript root not found: {args.root}")
 
     Handler.root = args.root
+    Handler.chats = args.chats
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"
     print(f"serving {args.root} at {url}")
+    found = chats_file(args.chats)
+    print(f"chats: {found}" if found else f"chats: no export at {args.chats}")
     if not args.no_browser:
         webbrowser.open(url)
     try:
