@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""claude-transcript-viewer — browse Claude Code transcripts with real math rendering.
+"""maude — browse Claude Code transcripts with real math rendering.
 
 Local web app, stdlib only. Serves a small JSON API over
 ~/.claude/projects/ plus the viewer.html page next to this script, which
-renders conversations with marked (markdown) + KaTeX (math). Double-click
-any rendered equation to copy its TeX source; shift-double-click copies
-it with delimiters.
+renders conversations with marked (markdown) + KaTeX (math). Open
+sessions live-update as new records are appended to the transcript.
+Double-click any rendered equation to copy its TeX source;
+shift-double-click copies it with delimiters.
 
 Usage:
-    python3 claude-transcript-viewer.py                  # serve + open browser
-    python3 claude-transcript-viewer.py --port 9000
-    python3 claude-transcript-viewer.py --root /path/to/projects --no-browser
+    python3 maude.py                  # serve + open browser
+    python3 maude.py --port 9000
+    python3 maude.py --root /path/to/projects --no-browser
 
 The page loads marked, DOMPurify and KaTeX from jsDelivr, so the browser
 needs network access; the server itself binds to localhost only.
@@ -179,10 +180,38 @@ def tool_result_text(block):
 MAX_BLOCK = 40_000  # chars; keeps giant tool dumps from choking the page
 
 
-def load_messages(root, project, session):
+def load_messages(root, project, session, offset=0):
+    """Parse records starting at byte `offset` (for live tailing).
+
+    Only whole lines are consumed: a partially-written trailing line stays
+    unparsed and the returned offset points at its start, so the next poll
+    picks it up once the writer finishes it. `reset` tells the client its
+    offset was stale (file truncated/rotated) and the pane must be rebuilt."""
     path = safe_join(root, project, session + ".jsonl")
+    reset = False
+    if offset and offset > os.path.getsize(path):
+        offset = 0
+        reset = True
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        data = fh.read()
+    end = len(data)
+    if data and not data.endswith(b"\n"):
+        end = data.rfind(b"\n") + 1  # 0 when the only line is partial
+    text = data[:end].decode("utf-8", "replace")
+
+    records = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
     messages = []
-    for obj in iter_jsonl(path):
+    for obj in records:
         if obj.get("type") not in ("user", "assistant"):
             continue
         if obj.get("isSidechain"):
@@ -235,9 +264,7 @@ def load_messages(root, project, session):
                     "blocks": blocks,
                 }
             )
-    for m in messages:
-        del m["mid"]
-    return messages
+    return {"offset": offset + end, "reset": reset, "messages": messages}
 
 
 def search_transcripts(root, query, limit=100):
@@ -312,7 +339,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(list_sessions(self.root, params["project"]))
             elif url.path == "/api/messages":
                 self.send_json(
-                    load_messages(self.root, params["project"], params["session"])
+                    load_messages(
+                        self.root,
+                        params["project"],
+                        params["session"],
+                        int(params.get("offset", 0)),
+                    )
                 )
             elif url.path == "/api/search":
                 query = params.get("q", "").strip()

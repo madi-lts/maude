@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude transcripts</title>
+<title>maude</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
@@ -156,19 +156,33 @@ function renderProjectList() {
   }
 }
 
+/* Open sessions poll for appended records once a second and render only
+   what's new, merging continuation records into the last turn — so tokens
+   stream in live without touching what's already on screen. */
+let live = { project: null, session: null, offset: 0, timer: null };
+
+function stopLive() {
+  if (live.timer) clearInterval(live.timer);
+  live = { project: null, session: null, offset: 0, timer: null };
+}
+
 async function openSession(project, sessionId, title) {
+  stopLive();
   activeSession = project.dir + "/" + sessionId;
   for (const row of document.querySelectorAll(".session"))
     row.classList.toggle("active", row.dataset.key === activeSession);
   document.getElementById("title").textContent = project.label + " — " + (title || sessionId);
   const pane = document.getElementById("messages");
-  pane.textContent = "Loading…";
+  pane.textContent = "";
+  live.project = project.dir;
+  live.session = sessionId;
   try {
-    const msgs = await api("/api/messages?project=" + encodeURIComponent(project.dir) +
-                           "&session=" + encodeURIComponent(sessionId));
-    pane.textContent = "";
-    if (!msgs.length) pane.append(el("div", "empty", "No displayable messages."));
-    for (const m of msgs) pane.append(renderMessage(m));
+    await fetchNew();
+    if (!pane.children.length)
+      pane.append(el("div", "empty", "No displayable messages yet."));
+    live.timer = setInterval(() => {
+      if (!document.hidden) fetchNew().catch(() => {});
+    }, 1000);
   } catch (err) {
     pane.textContent = "";
     pane.append(el("div", "empty", "Failed to load session: " + err.message));
@@ -176,20 +190,48 @@ async function openSession(project, sessionId, title) {
   document.querySelector("main").scrollTop = 0;
 }
 
+async function fetchNew() {
+  const initial = live.offset === 0;
+  const data = await api("/api/messages?project=" + encodeURIComponent(live.project) +
+    "&session=" + encodeURIComponent(live.session) + "&offset=" + live.offset);
+  live.offset = data.offset;
+  const pane = document.getElementById("messages");
+  if (data.reset) pane.textContent = "";
+  if (!data.messages.length) return;
+  const main = document.querySelector("main");
+  const follow = main.scrollHeight - main.scrollTop - main.clientHeight < 160;
+  const empty = pane.querySelector(".empty");
+  if (empty) empty.remove();
+  for (const m of data.messages) {
+    const last = pane.lastElementChild;
+    if (m.mid && last && last.dataset.mid === m.mid) {
+      appendBlocks(last, m.blocks);
+    } else {
+      pane.append(renderMessage(m));
+    }
+  }
+  if (!initial && follow) main.scrollTop = main.scrollHeight;
+}
+
 function renderMessage(m) {
   const box = el("div", "msg " + m.role + (m.meta ? " meta" : ""));
+  if (m.mid) box.dataset.mid = m.mid;
   const head = el("div", "mhead",
     (m.role === "user" ? "You" : "Claude") +
     (m.ts ? " · " + new Date(m.ts).toLocaleString() : ""));
   box.append(head);
-  for (const b of m.blocks) {
+  appendBlocks(box, m.blocks);
+  return box;
+}
+
+function appendBlocks(box, blocks) {
+  for (const b of blocks) {
     if (b.type === "text") box.append(renderMarkdown(b.text));
     else if (b.type === "thinking") box.append(collapsible("thinking", renderMarkdown(b.text)));
     else if (b.type === "tool_use") box.append(collapsible("tool: " + b.name, pre(b.input)));
     else if (b.type === "tool_result") box.append(collapsible("tool result", pre(b.text)));
     else if (b.type === "note") box.append(el("div", "mhead", b.text));
   }
-  return box;
 }
 
 function collapsible(label, body) {
