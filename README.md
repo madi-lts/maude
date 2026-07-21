@@ -3,8 +3,11 @@ Math-focused adaptation of Claude Code
 
 ## claude-transcript-viewer
 
-Single-file local web app for browsing Claude Code transcripts
-(`~/.claude/projects/*.jsonl`) with proper math rendering.
+Local web app for browsing Claude Code transcripts
+(`~/.claude/projects/*.jsonl`) with proper math rendering. Two files:
+`claude-transcript-viewer.py` (stdlib-only server + JSONL parsing) and
+`viewer.html` (the page, served from next to the script and re-read on
+every request, so front-end edits just need a refresh).
 
 ```
 python3 claude-transcript-viewer.py            # serve on localhost:8483 + open browser
