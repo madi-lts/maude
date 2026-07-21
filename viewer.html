@@ -24,6 +24,13 @@ body { margin: 0; font: 15px/1.55 system-ui, sans-serif; background: var(--bg); 
 #app { display: flex; height: 100vh; }
 aside { width: 320px; min-width: 240px; flex-shrink: 0; border-right: 1px solid var(--border);
         background: var(--panel); display: flex; flex-direction: column; }
+#tabs { display: flex; border-bottom: 1px solid var(--border); }
+.tab { flex: 1; padding: 10px 0 8px; background: none; border: none; cursor: pointer;
+       border-bottom: 2px solid transparent; color: var(--dim); font: inherit;
+       font-size: 13px; font-weight: 600; }
+.tab:hover { color: var(--fg); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab .glyph { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 #search { margin: 10px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px;
           background: var(--bg); color: var(--fg); font: inherit; }
 #search:focus { outline: 1px solid var(--accent); }
@@ -76,7 +83,11 @@ details.blk pre { margin: 6px 0; }
 <body>
 <div id="app">
   <aside>
-    <input id="search" type="search" placeholder="Search all transcripts…" autocomplete="off">
+    <nav id="tabs">
+      <button type="button" class="tab active" data-kind="code"><span class="glyph">&lt;/&gt;</span> Code</button>
+      <button type="button" class="tab" data-kind="chat">Chats</button>
+    </nav>
+    <input id="search" type="search" placeholder="Search code sessions…" autocomplete="off">
     <div id="sidebar-list"></div>
   </aside>
   <main>
@@ -93,6 +104,7 @@ window.addEventListener("DOMContentLoaded", init);
 
 let projects = [];
 let activeSession = null;
+let activeKind = "code";  // which tab is showing: "code" or "chat"
 
 async function api(path) {
   const r = await fetch(path);
@@ -103,14 +115,32 @@ async function api(path) {
 
 async function init() {
   marked.use({ gfm: true, breaks: true });
-  projects = await api("/api/projects");
-  renderProjectList();
+  for (const btn of document.querySelectorAll(".tab"))
+    btn.addEventListener("click", () => setTab(btn.dataset.kind));
+  await loadProjects();
   const search = document.getElementById("search");
   let timer = null;
   search.addEventListener("input", () => {
     clearTimeout(timer);
     timer = setTimeout(() => runSearch(search.value.trim()), 300);
   });
+}
+
+async function loadProjects() {
+  projects = await api("/api/projects?kind=" + activeKind);
+  renderProjectList();
+}
+
+function setTab(kind) {
+  if (kind === activeKind) return;
+  activeKind = kind;
+  for (const btn of document.querySelectorAll(".tab"))
+    btn.classList.toggle("active", btn.dataset.kind === kind);
+  const search = document.getElementById("search");
+  search.placeholder = kind === "chat" ? "Search chats…" : "Search code sessions…";
+  const query = search.value.trim();
+  if (query) runSearch(query);
+  else loadProjects();
 }
 
 function el(tag, cls, text) {
@@ -124,7 +154,9 @@ function renderProjectList() {
   const list = document.getElementById("sidebar-list");
   list.textContent = "";
   if (!projects.length) {
-    list.append(el("div", "empty", "No projects found under the transcript root."));
+    list.append(el("div", "empty",
+      activeKind === "chat" ? "No chats found under the transcript root."
+                            : "No code sessions found under the transcript root."));
     return;
   }
   for (const p of projects) {
@@ -140,7 +172,8 @@ function renderProjectList() {
       sessions.hidden = !sessions.hidden;
       if (loaded || sessions.hidden) return;
       loaded = true;
-      const items = await api("/api/sessions?project=" + encodeURIComponent(p.dir));
+      const items = await api("/api/sessions?project=" + encodeURIComponent(p.dir) +
+        "&kind=" + activeKind);
       for (const s of items) {
         const row = el("div", "session");
         row.dataset.key = p.dir + "/" + s.id;
@@ -358,12 +391,14 @@ function toast(msg) {
 
 async function runSearch(query) {
   const list = document.getElementById("sidebar-list");
-  if (!query) { renderProjectList(); return; }
+  if (!query) { loadProjects(); return; }
   list.textContent = "Searching…";
-  const hits = await api("/api/search?q=" + encodeURIComponent(query));
+  const hits = await api("/api/search?q=" + encodeURIComponent(query) +
+    "&kind=" + activeKind);
   list.textContent = "";
   if (!hits.length) {
-    list.append(el("div", "empty", "No matches."));
+    list.append(el("div", "empty",
+      "No matches in " + (activeKind === "chat" ? "chats." : "code sessions.")));
     return;
   }
   for (const h of hits) {

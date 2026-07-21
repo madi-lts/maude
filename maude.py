@@ -28,8 +28,9 @@ from urllib.parse import parse_qs, urlparse
 
 DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
 
-# cheap per-line check for countable records, tolerant of JSON spacing
+# cheap per-line checks, tolerant of JSON spacing
 MSG_TYPE_RE = re.compile(r'"type"\s*:\s*"(?:user|assistant)"')
+TOOL_USE_RE = re.compile(r'"type"\s*:\s*"tool_use"')
 
 # --------------------------------------------------------------------------
 # Transcript parsing
@@ -87,7 +88,35 @@ def project_label(project_dir, dirname):
     return dirname
 
 
-def list_projects(root):
+# session kind ("code" when the transcript contains any tool call, "chat"
+# for pure conversation), cached per path — transcripts only ever grow, so
+# (mtime, size) invalidates the entry for live sessions.
+_kind_cache = {}
+
+
+def session_kind(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "chat"
+    stamp = (st.st_mtime, st.st_size)
+    cached = _kind_cache.get(path)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    kind = "chat"
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if TOOL_USE_RE.search(line):
+                    kind = "code"
+                    break
+    except OSError:
+        pass
+    _kind_cache[path] = (stamp, kind)
+    return kind
+
+
+def list_projects(root, kind=None):
     out = []
     try:
         entries = list(os.scandir(root))
@@ -96,15 +125,17 @@ def list_projects(root):
     for entry in entries:
         if not entry.is_dir():
             continue
-        files = session_files(entry.path)
-        if not files:
+        paths = [os.path.join(entry.path, f) for f in session_files(entry.path)]
+        if kind:
+            paths = [p for p in paths if session_kind(p) == kind]
+        if not paths:
             continue
-        mtime = max(os.path.getmtime(os.path.join(entry.path, f)) for f in files)
+        mtime = max(os.path.getmtime(p) for p in paths)
         out.append(
             {
                 "dir": entry.name,
                 "label": project_label(entry.path, entry.name),
-                "sessions": len(files),
+                "sessions": len(paths),
                 "mtime": mtime,
             }
         )
@@ -139,11 +170,14 @@ def session_title(path):
     return fallback or "(no user message)"
 
 
-def list_sessions(root, project):
+def list_sessions(root, project, kind=None):
     pdir = safe_join(root, project)
     out = []
     for name in session_files(pdir):
         path = os.path.join(pdir, name)
+        skind = session_kind(path)
+        if kind and skind != kind:
+            continue
         title = session_title(path)
         if len(title) > 120:
             title = title[:120] + "…"
@@ -157,6 +191,7 @@ def list_sessions(root, project):
                 "id": name[:-6],
                 "title": title,
                 "messages": count,
+                "kind": skind,
                 "mtime": os.path.getmtime(path),
             }
         )
@@ -267,18 +302,21 @@ def load_messages(root, project, session, offset=0):
     return {"offset": offset + end, "reset": reset, "messages": messages}
 
 
-def search_transcripts(root, query, limit=100):
+def search_transcripts(root, query, kind=None, limit=100):
     """Case-insensitive substring search over text/thinking blocks.
 
     Lines are pre-filtered with a raw substring check before JSON parsing,
     so matches hidden behind \\uXXXX escapes can be missed — acceptable for
-    an interactive grep."""
+    an interactive grep. `kind` restricts the search to code or chat
+    sessions."""
     q = query.lower()
     results = []
-    for proj in list_projects(root):
+    for proj in list_projects(root, kind):
         pdir = os.path.join(root, proj["dir"])
         for name in session_files(pdir):
             path = os.path.join(pdir, name)
+            if kind and session_kind(path) != kind:
+                continue
             with open(path, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     if q not in line.lower():
@@ -330,13 +368,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         params = {k: v[0] for k, v in parse_qs(url.query).items()}
+        kind = params.get("kind")
+        if kind not in ("code", "chat"):
+            kind = None
         try:
             if url.path in ("", "/"):
                 self.respond(load_page(), "text/html; charset=utf-8")
             elif url.path == "/api/projects":
-                self.send_json(list_projects(self.root))
+                self.send_json(list_projects(self.root, kind))
             elif url.path == "/api/sessions":
-                self.send_json(list_sessions(self.root, params["project"]))
+                self.send_json(list_sessions(self.root, params["project"], kind))
             elif url.path == "/api/messages":
                 self.send_json(
                     load_messages(
@@ -348,7 +389,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
             elif url.path == "/api/search":
                 query = params.get("q", "").strip()
-                self.send_json(search_transcripts(self.root, query) if query else [])
+                self.send_json(
+                    search_transcripts(self.root, query, kind) if query else []
+                )
             else:
                 self.send_error(404)
         except (KeyError, ValueError) as exc:
