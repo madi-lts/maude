@@ -18,6 +18,10 @@ No dependencies beyond the Python stdlib; the page pulls marked, DOMPurify and
 KaTeX from jsDelivr, so the *browser* needs network access (the server binds to
 localhost only).
 
+- **Tabs** — `</> Code` and `Chats` split the sidebar: a session counts as
+  code when its transcript contains any tool call, and as a chat when it's
+  pure conversation. Projects, session lists, and search all follow the
+  active tab.
 - **Sidebar** — projects (labeled from the `cwd` recorded in transcripts) with
   sessions sorted by last modified, titled by summary or first user message.
 - **Math** — `$…$`, `$$…$$`, `\(…\)`, `\[…\]`, and bare `\begin{align}`-style
@@ -30,7 +34,7 @@ localhost only).
 - **Tool calls / thinking** — rendered as collapsed blocks so they don't drown
   out the conversation.
 - **Search** — the sidebar box greps text and thinking blocks across every
-  project; click a hit to open its session.
+  project in the active tab; click a hit to open its session.
 - **Live tail** — the open session polls for newly appended records once a
   second and renders only what's new (continuation records merge into the
   current turn), so an in-progress Claude session streams into the page
