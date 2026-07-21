@@ -1,14 +1,17 @@
 # maude
 Math-focused adaptation of Claude Code
 
-## claude-transcript-viewer
+## maude viewer
 
-Single-file local web app for browsing Claude Code transcripts
-(`~/.claude/projects/*.jsonl`) with proper math rendering.
+Local web app for browsing Claude Code transcripts
+(`~/.claude/projects/*.jsonl`) with proper math rendering. Two files:
+`maude.py` (stdlib-only server + JSONL parsing) and `viewer.html` (the
+page, served from next to the script and re-read on every request, so
+front-end edits just need a refresh).
 
 ```
-python3 claude-transcript-viewer.py            # serve on localhost:8483 + open browser
-python3 claude-transcript-viewer.py --help     # --port, --root, --host, --no-browser
+python3 maude.py            # serve on localhost:8483 + open browser
+python3 maude.py --help     # --port, --root, --host, --no-browser
 ```
 
 No dependencies beyond the Python stdlib; the page pulls marked, DOMPurify and
@@ -28,3 +31,7 @@ localhost only).
   out the conversation.
 - **Search** — the sidebar box greps text and thinking blocks across every
   project; click a hit to open its session.
+- **Live tail** — the open session polls for newly appended records once a
+  second and renders only what's new (continuation records merge into the
+  current turn), so an in-progress Claude session streams into the page
+  without refreshing. If you're scrolled to the bottom it follows along.
