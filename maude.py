@@ -88,9 +88,11 @@ def project_label(project_dir, dirname):
     return dirname
 
 
-# session kind ("code" when the transcript contains any tool call, "chat"
-# for pure conversation), cached per path — transcripts only ever grow, so
-# (mtime, size) invalidates the entry for live sessions.
+# A session counts as "code" when tool activity dominates the transcript:
+# at least three tool calls, and at least one per five user/assistant
+# records. Incidental tool use (a chat where Claude checks an integral
+# with python) stays a chat. Cached per path — transcripts only ever
+# grow, so (mtime, size) invalidates the entry for live sessions.
 _kind_cache = {}
 
 
@@ -103,15 +105,16 @@ def session_kind(path):
     cached = _kind_cache.get(path)
     if cached and cached[0] == stamp:
         return cached[1]
-    kind = "chat"
+    tools = records = 0
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                if TOOL_USE_RE.search(line):
-                    kind = "code"
-                    break
+                if MSG_TYPE_RE.search(line):
+                    records += 1
+                tools += len(TOOL_USE_RE.findall(line))
     except OSError:
         pass
+    kind = "code" if tools >= 3 and tools * 5 >= records else "chat"
     _kind_cache[path] = (stamp, kind)
     return kind
 
@@ -303,7 +306,8 @@ def load_messages(root, project, session, offset=0):
 
 
 def search_transcripts(root, query, kind=None, limit=100):
-    """Case-insensitive substring search over text/thinking blocks.
+    """Case-insensitive substring search over text/thinking blocks and
+    session titles (summary records).
 
     Lines are pre-filtered with a raw substring check before JSON parsing,
     so matches hidden behind \\uXXXX escapes can be missed — acceptable for
@@ -324,6 +328,21 @@ def search_transcripts(root, query, kind=None, limit=100):
                     try:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") == "summary":
+                        text = obj.get("summary") or ""
+                        if q in text.lower():
+                            results.append(
+                                {
+                                    "project": proj["dir"],
+                                    "label": proj["label"],
+                                    "session": name[:-6],
+                                    "role": "title",
+                                    "snippet": text,
+                                }
+                            )
+                            if len(results) >= limit:
+                                return results
                         continue
                     if obj.get("type") not in ("user", "assistant"):
                         continue
